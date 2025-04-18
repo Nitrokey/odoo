@@ -4,7 +4,7 @@ from datetime import date
 from markupsafe import Markup
 import json
 
-from odoo import _, api, fields, models, SUPERUSER_ID
+from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
 
@@ -107,7 +107,7 @@ class StockPicking(models.Model):
                         'mail.mail_activity_data_warning',
                         date.today(),
                         note=pick._carrier_exception_note(exception_message),
-                        user_id=pick.user_id.id or self.env.user.id or SUPERUSER_ID,
+                        user_id=pick.user_id.id or self.env.uid,
                         )
                 else:
                     raise e
