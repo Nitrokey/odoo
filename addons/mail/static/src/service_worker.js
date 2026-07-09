@@ -18,6 +18,43 @@ function arrayBufferToBase64Url(buffer) {
     return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 }
 
+// --- IndexedDB helpers: persist device token across service worker restarts ---
+const _PUSH_DB_NAME = "odoo_push";
+const _PUSH_DB_VERSION = 1;
+const _PUSH_STORE_NAME = "device";
+const _PUSH_TOKEN_KEY = "token";
+
+function _openPushDb() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(_PUSH_DB_NAME, _PUSH_DB_VERSION);
+        req.onupgradeneeded = (event) => {
+            event.target.result.createObjectStore(_PUSH_STORE_NAME);
+        };
+        req.onsuccess = (event) => resolve(event.target.result);
+        req.onerror = (event) => reject(event.target.error);
+    });
+}
+
+async function _storePushDeviceToken(token) {
+    const db = await _openPushDb();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(_PUSH_STORE_NAME, "readwrite");
+        tx.objectStore(_PUSH_STORE_NAME).put(token, _PUSH_TOKEN_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = (event) => reject(event.target.error);
+    });
+}
+
+async function _loadPushDeviceToken() {
+    const db = await _openPushDb();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(_PUSH_STORE_NAME, "readonly");
+        const req = tx.objectStore(_PUSH_STORE_NAME).get(_PUSH_TOKEN_KEY);
+        req.onsuccess = (event) => resolve(event.target.result ?? null);
+        req.onerror = (event) => reject(event.target.error);
+    });
+}
+
 async function openDiscussChannel(channelId, action) {
     const discussURLRegexes = [
         new RegExp("/odoo/discuss"),
@@ -62,14 +99,17 @@ self.addEventListener("push", (event) => {
 /** @type {Map<string, Function>} string is correlationId and Function is handler */
 self.handlePushEventMessageFns = new Map();
 
-self.addEventListener("message", ({ data }) => {
-    const { type, payload } = data;
+self.addEventListener("message", (event) => {
+    const { type, payload } = event.data;
     if (type === "notification-display-response") {
         const fn = self.handlePushEventMessageFns.get(payload.correlationId);
         if (fn) {
             self.handlePushEventMessageFns.delete(payload.correlationId);
-            fn({ data });
+            fn({ data: event.data });
         }
+    }
+    if (type === "STORE_PUSH_TOKEN" && payload?.token) {
+        event.waitUntil(_storePushDeviceToken(payload.token));
     }
 });
 
@@ -101,39 +141,113 @@ async function handlePushEvent(notification) {
         }, 500);
     });
 }
-self.addEventListener("pushsubscriptionchange", async (event) => {
-    if (!event.oldSubscription) {
-        return;
-    }
-    const subscription = await self.registration.pushManager.subscribe(
-        event.oldSubscription.options
+self.addEventListener("pushsubscriptionchange", (event) => {
+    event.waitUntil(
+        (async () => {
+            if (!event.oldSubscription) {
+                return;
+            }
+            const newSubscription = await self.registration.pushManager.subscribe(
+                event.oldSubscription.options
+            );
+            const subscriptionData = newSubscription.toJSON();
+            const oldEndpoint = event.oldSubscription.endpoint;
+
+            // Encode the VAPID public key as base64url to pass to the server for validation.
+            const vapid_public_key = arrayBufferToBase64Url(
+                newSubscription.options.applicationServerKey
+            );
+
+            /**
+             * Attempt to refresh the subscription using the given access token.
+             * On success the server rotates the access token and returns the new value.
+             * @param {string} accessToken
+             * @returns {Object|null} server result or null on network error
+             */
+            async function tryRefresh(accessToken) {
+                try {
+                    const resp = await fetch("/web/push/device/refresh", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            jsonrpc: "2.0",
+                            method: "call",
+                            id: 1,
+                            params: {
+                                token: accessToken,
+                                ...subscriptionData,
+                                vapid_public_key,
+                                previousEndpoint: oldEndpoint,
+                            },
+                        }),
+                    });
+                    const json = await resp.json();
+                    return json.result ?? null;
+                } catch {
+                    return null;
+                }
+            }
+
+            // 1. Prefer access-token-based refresh: works even when the Odoo session
+            //    has expired (access token is stored in IndexedDB, not a session cookie).
+            const token = await _loadPushDeviceToken().catch(() => null);
+            if (token) {
+                const result = await tryRefresh(token);
+                if (result?.success) {
+                    // Server rotated the access token; persist the new one.
+                    if (result.token) {
+                        await _storePushDeviceToken(result.token);
+                    }
+                    return;
+                }
+
+                // 2. Access token is valid but expired: use the HttpOnly refresh token
+                //    cookie (attached automatically by the browser) to rotate both tokens.
+                if (result?.reason === "expired") {
+                    try {
+                        const rotateResp = await fetch("/web/push/device/token/rotate", {
+                            method: "POST",
+                            credentials: "include", // browser attaches the HttpOnly cookie
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ previousEndpoint: oldEndpoint }),
+                        });
+                        const rotateJson = await rotateResp.json();
+                        if (rotateJson.token) {
+                            await _storePushDeviceToken(rotateJson.token);
+                            const retryResult = await tryRefresh(rotateJson.token);
+                            if (retryResult?.success) {
+                                if (retryResult.token) {
+                                    await _storePushDeviceToken(retryResult.token);
+                                }
+                                return;
+                            }
+                        }
+                    } catch {
+                        // fall through to session-based fallback below
+                    }
+                }
+            }
+
+            // 3. Fallback: session-based registration. Requires an active session cookie
+            //    but also sets a fresh refresh token cookie for future renewals.
+            try {
+                const resp = await fetch("/web/push/device/register", {
+                    method: "POST",
+                    credentials: "include",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        ...subscriptionData,
+                        vapid_public_key,
+                        previousEndpoint: oldEndpoint,
+                    }),
+                });
+                const json = await resp.json();
+                if (json.token) {
+                    await _storePushDeviceToken(json.token);
+                }
+            } catch {
+                // Nothing more we can do; the subscription will be renewed on next login.
+            }
+        })()
     );
-    // Encode the VAPID public key as base64url to pass to the server for validation.
-    // Without this, register_devices always raises InvalidVapidError and the renewed
-    // subscription is never saved, breaking push notifications after a few days.
-    const vapid_public_key = arrayBufferToBase64Url(subscription.options.applicationServerKey);
-    await fetch("/web/dataset/call_kw/mail.push.device/register_devices", {
-        headers: {
-            "Content-type": "application/json",
-        },
-        body: JSON.stringify({
-            id: 1,
-            jsonrpc: "2.0",
-            method: "call",
-            params: {
-                model: "mail.push.device",
-                method: "register_devices",
-                args: [],
-                kwargs: {
-                    ...subscription.toJSON(),
-                    previousEndpoint: event.oldSubscription.endpoint,
-                    vapid_public_key,
-                },
-                context: {},
-            },
-        }),
-        method: "POST",
-        mode: "cors",
-        credentials: "include",
-    });
 });
