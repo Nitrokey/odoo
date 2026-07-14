@@ -209,12 +209,18 @@ self.addEventListener("pushsubscriptionchange", (event) => {
                             method: "POST",
                             credentials: "include", // browser attaches the HttpOnly cookie
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ previousEndpoint: oldEndpoint }),
+                            body: JSON.stringify({
+                                jsonrpc: "2.0",
+                                method: "call",
+                                id: 1,
+                                params: { previousEndpoint: oldEndpoint },
+                            }),
                         });
                         const rotateJson = await rotateResp.json();
-                        if (rotateJson.token) {
-                            await _storePushDeviceToken(rotateJson.token);
-                            const retryResult = await tryRefresh(rotateJson.token);
+                        const rotateResult = rotateJson.result ?? {};
+                        if (rotateResult.token) {
+                            await _storePushDeviceToken(rotateResult.token);
+                            const retryResult = await tryRefresh(rotateResult.token);
                             if (retryResult?.success) {
                                 if (retryResult.token) {
                                     await _storePushDeviceToken(retryResult.token);
@@ -236,14 +242,20 @@ self.addEventListener("pushsubscriptionchange", (event) => {
                     credentials: "include",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
-                        ...subscriptionData,
-                        vapid_public_key,
-                        previousEndpoint: oldEndpoint,
+                        jsonrpc: "2.0",
+                        method: "call",
+                        id: 1,
+                        params: {
+                            ...subscriptionData,
+                            vapid_public_key,
+                            previousEndpoint: oldEndpoint,
+                        },
                     }),
                 });
                 const json = await resp.json();
-                if (json.token) {
-                    await _storePushDeviceToken(json.token);
+                const result = json.result ?? {};
+                if (result.token) {
+                    await _storePushDeviceToken(result.token);
                 }
             } catch {
                 // Nothing more we can do; the subscription will be renewed on next login.
