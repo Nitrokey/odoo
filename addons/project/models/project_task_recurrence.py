@@ -5,6 +5,7 @@ from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
 
 from dateutil.relativedelta import relativedelta
+from markupsafe import Markup
 
 class ProjectTaskRecurrence(models.Model):
     _name = 'project.task.recurrence'
@@ -73,8 +74,16 @@ class ProjectTaskRecurrence(models.Model):
             new_task = occurrence_from.with_context(copy_project=True).sudo().copy(
                 self._create_next_occurrence_values(occurrence_from)
             )
+            for follower in occurrence_from.sudo().message_follower_ids:
+                new_task.message_subscribe(follower.partner_id.ids, follower.subtype_ids.ids)
             new_task.with_context(mail_auto_subscribe_no_notify=False)._task_message_auto_subscribe_notify(
                 {new_task: new_task.user_ids - self.env.user}
+            )
+            # copy() disables the creation log, post it so followers are notified
+            new_task.message_post(
+                subtype_id=new_task._creation_subtype().id,
+                author_id=self.env.user.partner_id.id,
+                body=Markup('<div summary="o_mail_notification"><p>%s</p></div>') % new_task._creation_message(),
             )
 
     def _create_next_occurrence_values(self, occurrence_from):
