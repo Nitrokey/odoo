@@ -236,7 +236,9 @@ class TestProjectRecurrence(TransactionCase):
             form.repeat_unit = 'month'
             form.repeat_type = 'forever'
             task = form.save()
-        task.message_subscribe(follower.ids)
+        internal_follower = self.user_projectuser
+        internal_follower.notification_type = 'inbox'
+        task.message_subscribe((follower | internal_follower.partner_id).ids)
 
         with freeze_time(self.date_01_01 + relativedelta(months=1)):
             task.state = '1_done'
@@ -244,14 +246,20 @@ class TestProjectRecurrence(TransactionCase):
         new_task = task.recurrence_id.task_ids - task
         self.assertEqual(len(new_task), 1, "a new occurrence should have been created")
         self.assertIn(follower, new_task.message_partner_ids, "the follower should follow the new occurrence")
+        self.assertIn(internal_follower.partner_id, new_task.message_partner_ids, "the internal follower should follow the new occurrence")
 
         creation_message = new_task.message_ids.filtered(
             lambda m: m.subtype_id == self.env.ref('project.mt_task_new')
         )
         self.assertEqual(len(creation_message), 1, "a creation message should be posted")
+        notifications = creation_message.notification_ids
         self.assertIn(
-            follower, creation_message.notification_ids.res_partner_id,
+            follower, notifications.res_partner_id,
             "the follower should be notified about the auto-created recurring task",
+        )
+        self.assertEqual(
+            notifications.filtered(lambda n: n.res_partner_id == internal_follower.partner_id).notification_type, 'inbox',
+            "the internal follower should get an inbox notification about the auto-created recurring task",
         )
 
     def test_recurrence_copy_task_dependency(self):

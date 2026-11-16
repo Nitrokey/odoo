@@ -79,11 +79,13 @@ class ProjectTaskRecurrence(models.Model):
             new_task.with_context(mail_auto_subscribe_no_notify=False)._task_message_auto_subscribe_notify(
                 {new_task: new_task.user_ids - self.env.user}
             )
-            # copy() disables the creation log, post it so followers are notified
+            # copy() disables the creation log. The "Task Created" subtype is not
+            # a default follower subtype, so notify the task followers explicitly.
             new_task.message_post(
                 subtype_id=new_task._creation_subtype().id,
                 author_id=self.env.user.partner_id.id,
                 body=Markup('<div summary="o_mail_notification"><p>%s</p></div>') % new_task._creation_message(),
+                partner_ids=(occurrence_from.sudo().message_partner_ids - new_task.user_ids.partner_id).ids,
             )
 
     def _create_next_occurrence_values(self, occurrence_from):
